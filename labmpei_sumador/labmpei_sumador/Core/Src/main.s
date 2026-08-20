@@ -1,11 +1,13 @@
 /* ====================================================================
-   Proyecto: Sumador Multiplexado (Modificado para PB0, PB1, PB3-PB8)
+   Proyecto: Sumador Multiplexado (Modificado con Ruteo para PB9)
    Target:   STM32F103 (Proteus / Blue Pill)
    Reloj:    HSI Interno (8 MHz)
    Descripción de Entradas/Salidas:
    - Entradas: PA0 - PA7  -> DIP Switch (Datos A y B)
    - Pulsador: PC13       -> Control de avance (Pull-Up)
-   - Salidas:  PB0, PB1, PB3 - PB8 -> Resultado Suma (8 bits, salta PB2)
+   - Salidas:  PB0 - PB7  -> Resultado Suma (8 bits)
+               PB8        -> Acarreo / Carry Out (1 bit)
+               PB9        -> Salto físico del bit 2 de la suma
                PB13       -> LED D1 (Indicador Dato A capturado)
                PB14       -> LED D2 (Indicador Dato B capturado)
                PB15       -> LED D3 (Indicador Suma realizada)
@@ -61,15 +63,14 @@ main:
     LDR R1, =0x44444444
     STR R1, [R0]
 
-    /* 4. Configurar PB0, PB1 y PB3-PB7 como Salidas Push-Pull 2MHz
-       (Nota: PB2 se deja como Input Floating '4' porque se salta) */
+    /* 4. Configurar PB0-PB7 como Salidas Push-Pull 2MHz (0x22222222) */
     LDR R0, =GPIOB_CRL
-    LDR R1, =0x22224222           @ Modificado: PB2 = 4 (Entrada), los demás = 2 (Salida)
+    LDR R1, =0x22222222
     STR R1, [R0]
 
-    /* 5. Configurar PB8, PB13, PB14 y PB15 como Salidas Push-Pull 2MHz */
+    /* 5. Configurar PB8, PB9, PB13, PB14 y PB15 como Salidas Push-Pull 2MHz */
     LDR R0, =GPIOB_CRH
-    LDR R1, =0x22200002           @ PB15, PB14, PB13 y PB8 en modo salida
+    LDR R1, =0x22200022           @ PB15, PB14, PB13, PB9 y PB8 en modo salida
     STR R1, [R0]
 
     /* 6. Configurar PC13 como Entrada Digital Normal (Pull-Up) */
@@ -101,7 +102,7 @@ inicio_proceso:
 
 
 /* ====================================================================
-   DESARROLLO IMPLEMENTADO PARA CLASE (CAPTURA B, SUMA Y REINICIO)
+   DESARROLLO DE LA LÓGICA DE CAPTURA B, SUMA Y REINICIO
    ==================================================================== */
 
     /* --- 1. CAPTURA DEL DATO B --- */
@@ -111,7 +112,7 @@ inicio_proceso:
     LDR R5, [R0]
     AND R5, R5, #0xFF                 @ R5 = Dato B
 
-    /* Apagar D1 (PB13) y encender D2 (PB14) sin perder estados */
+    /* Apagar D1 (PB13) y encender D2 (PB14) respetando estados previos */
     LDR R0, =GPIOB_ODR
     LDR R1, [R0]
     BIC R1, R1, #(1 << 13)            @ Apaga D1
@@ -119,31 +120,29 @@ inicio_proceso:
     STR R1, [R0]
 
 
-/* --- 2. CÁLCULO Y MUESTRA DE LA SUMA --- */
+    /* --- 2. CÁLCULO Y MUESTRA DE LA SUMA --- */
     BL esperar_pulsacion              @ Espera la tercera pulsación en PC13
 
     ADD R6, R4, R5                    @ R6 = Dato A + Dato B
 
-    /* Corrección de mapeo para saltar estrictamente PB2:
-       - Bits [1:0] van a PB0 y PB1.
-       - Bits [7:2] se desplazan 1 bit a la izquierda para ocupar PB3..PB8. */
-    AND R2, R6, #0x03                 @ R2 = bits 0 y 1
-    AND R3, R6, #0xFC                 @ R3 = bits 2 al 7
-    LSL R3, R3, #1                    @ Desplaza para saltar PB2 (caen en PB3..PB8)
-    ORR R2, R2, R3                    @ R2 unifica el resultado mapeado
+    /* Parche de ruteo para lidiar con el pin PB2 (salto al pin PB9) */
+    AND R2, R6, #(1 << 2)             @ Aisla el bit 2 de la suma
+    BIC R6, R6, #(1 << 2)             @ Borra el bit 2 de su posición original en R6
+    LSL R2, R2, #7                    @ Desplaza el bit 2 del índice 2 al índice 9 (PB9)
+    ORR R6, R6, R2                    @ Reintegra el bit movido dentro del registro de resultado
 
-    /* Actualizar GPIOB ODR limpiando solo los pines de resultado (PB0-PB1 y PB3-PB8) */
+/* Apagar D2 (PB14), encender D3 (PB15) y actualizar salidas del Puerto B */
     LDR R0, =GPIOB_ODR
     LDR R1, [R0]
 
-    LDR R3, =0x01FA                   @ Máscara exacta: bits 0,1 y 3..8 en 1 (PB2 = 0)
-    BIC R1, R1, R3                    @ Limpia únicamente los pines de resultado viejos
-    ORR R1, R1, R2                    @ Inserta el nuevo resultado calculado
+    LDR R3, =0x01FF                   @ Carga la máscara completa de resultados (PB0-PB8 y PB9)
+    BIC R1, R1, R3                    @ Limpia los pines anteriores de forma segura
+    ORR R1, R1, R6                    @ Inserta la suma con su bit ruteado
 
-    /* Gestionar LEDs indicadores D2 y D3 */
-    BIC R1, R1, #(1 << 14)            @ Apaga D2 (PB14)
-    ORR R1, R1, #(1 << 15)            @ Enciende D3 (PB15)
+    BIC R1, R1, #(1 << 14)            @ Apaga D2
+    ORR R1, R1, #(1 << 15)            @ Enciende D3
     STR R1, [R0]
+
 
     /* --- 3. REINICIO DE LA SECUENCIA --- */
     BL esperar_pulsacion              @ Espera la cuarta pulsación en PC13
